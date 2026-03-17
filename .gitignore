@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+.venv/
+
+# Project data
+/data/
+*.sqlite3
+
+# Secrets
+cookies*.txt
+cookies*.json
+.env
+*.json
