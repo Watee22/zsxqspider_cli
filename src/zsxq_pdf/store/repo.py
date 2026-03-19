@@ -212,13 +212,16 @@ def iter_attachments_for_download(
     status: str,
     limit: int | None = None,
     topic_id: str | None = None,
+    day: str | None = None,
     tag_names: list[str] | None = None,
     include_unclassified: bool = False,
 ):
-    """Iterate attachments optionally filtered by tag name.
+    """Iterate PDF attachments optionally filtered by tag name.
 
     If tag_names is provided, only attachments whose topic is mapped to those tags are returned.
     If include_unclassified is True, also include attachments with no topic_tags mapping.
+    If day is provided, only attachments whose create_time falls on YYYY-MM-DD are returned.
+    Non-PDF attachments are excluded here so the yanbao pipeline only downloads/converts PDFs.
     """
 
     base_select = """
@@ -227,12 +230,21 @@ def iter_attachments_for_download(
     FROM attachments a
     """
 
-    where = ["a.group_id=?", "a.status=?"]
+    where = [
+        "a.group_id=?",
+        "a.status=?",
+        "a.filename IS NOT NULL",
+        "LOWER(TRIM(a.filename)) LIKE '%.pdf'",
+    ]
     params: list[object] = [group_id, status]
 
     if topic_id is not None:
         where.append("a.topic_id=?")
         params.append(topic_id)
+
+    if day is not None:
+        where.append("substr(a.create_time, 1, 10)=?")
+        params.append(day)
 
     join = ""
     tag_filter_sql = ""

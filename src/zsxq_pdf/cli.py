@@ -521,6 +521,7 @@ def download(
     retry_failed: bool = Option(False, help="Also retry attachments with status=failed."),
     retries: int = Option(5, help="Max retry attempts for transient errors."),
     topic: str = Option("", help="Only download files for this topic_id (optional)."),
+    day: str = Option("", help="Only download files whose create_time falls on this YYYY-MM-DD day."),
     tag: list[str] = Option([], "--tag", "-t", help="Only download attachments for these tag names (repeatable)."),
     include_unclassified: bool = Option(True, help="Include attachments with no matched tag (stored under _unclassified)."),
     only_unclassified: bool = Option(False, help="Only download attachments with no matched tag."),
@@ -569,6 +570,7 @@ def download(
         "download",
         "start",
         group_id=group,
+        day=(day or None),
         dry_run=dry_run,
         statuses=statuses,
         tag_names=tag,
@@ -584,6 +586,7 @@ def download(
                         status=st,
                         limit=(limit if limit else None),
                         topic_id=(topic if topic else None),
+                        day=(day if day else None),
                         tag_names=(tag if tag else None),
                         include_unclassified=include_unclassified,
                     ):
@@ -630,6 +633,7 @@ def download(
                             status=st,
                             limit=(limit if limit else None),
                             topic_id=(topic if topic else None),
+                            day=(day if day else None),
                             tag_names=(tag if tag else None),
                             include_unclassified=include_unclassified,
                         ):
@@ -732,11 +736,15 @@ def download(
     if dry_run:
         summary["items"] = planned_items
 
+    tolerable_1030 = (failed > 0) and all(("code 1030" in msg) or ("may require mobile app" in msg) for msg in failures)
+
     _finish(
         ctx,
         "download",
-        ok=(failed == 0),
-        exit_code=(0 if dry_run or failed == 0 else 5),
+        # Treat code=1030 (requires mobile app) as a tolerable per-item failure so downstream
+        # stages (convert/analysis) can still run on successfully downloaded PDFs.
+        ok=(failed == 0 or tolerable_1030),
+        exit_code=(0 if dry_run or failed == 0 or tolerable_1030 else 5),
         summary=summary,
         errors=failures,
     )
@@ -748,6 +756,7 @@ def convert(
     group: str = Option(..., help="Group ID."),
     data_dir: Path = Option(Path("data"), help="Data directory."),
     limit: int = Option(0, help="Max files to convert (0 = no limit)."),
+    day: str = Option("", help="Only convert files whose create_time falls on this YYYY-MM-DD day."),
     tag: list[str] = Option([], "--tag", "-t", help="Only convert attachments for these tag names (repeatable)."),
     include_unclassified: bool = Option(True, help="Include attachments with no matched tag (stored under _unclassified)."),
     only_unclassified: bool = Option(False, help="Only convert attachments with no matched tag."),
@@ -781,7 +790,7 @@ def convert(
     planned_items: list[dict[str, Any]] = []
     failures: list[str] = []
 
-    _emit_event(ctx, "convert", "start", group_id=group, dry_run=dry_run, tag_names=tag)
+    _emit_event(ctx, "convert", "start", group_id=group, day=(day or None), dry_run=dry_run, tag_names=tag)
 
     try:
         with connect(cfg.db_path) as conn:
@@ -790,6 +799,7 @@ def convert(
                 group_id=group,
                 status="downloaded",
                 limit=(limit if limit else None),
+                day=(day if day else None),
                 tag_names=(tag if tag else None),
                 include_unclassified=(include_unclassified or only_unclassified),
             ):
