@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from zsxq_pdf.convert.office_to_md import is_supported_document
+
 
 def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -216,12 +218,12 @@ def iter_attachments_for_download(
     tag_names: list[str] | None = None,
     include_unclassified: bool = False,
 ):
-    """Iterate PDF attachments optionally filtered by tag name.
+    """Iterate supported document attachments optionally filtered by tag name.
 
     If tag_names is provided, only attachments whose topic is mapped to those tags are returned.
     If include_unclassified is True, also include attachments with no topic_tags mapping.
     If day is provided, only attachments whose create_time falls on YYYY-MM-DD are returned.
-    Non-PDF attachments are excluded here so the yanbao pipeline only downloads/converts PDFs.
+    Supported documents currently include pdf/doc/docx/wps.
     """
 
     base_select = """
@@ -234,7 +236,6 @@ def iter_attachments_for_download(
         "a.group_id=?",
         "a.status=?",
         "a.filename IS NOT NULL",
-        "LOWER(TRIM(a.filename)) LIKE '%.pdf'",
     ]
     params: list[object] = [group_id, status]
 
@@ -270,7 +271,9 @@ def iter_attachments_for_download(
         sql += " LIMIT ?"
         params.append(limit)
 
-    yield from conn.execute(sql, params)
+    for row in conn.execute(sql, params):
+        if is_supported_document(row["filename"]):
+            yield row
 
 
 def get_attachment_topic_and_time(

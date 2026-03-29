@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 
 import httpx
 
@@ -20,6 +21,11 @@ class ZsxqClient:
     Implements known working endpoints based on community projects and verified patterns:
     - GET /v2/groups/{group_id}/files
     - GET /v2/files/{file_id}/download_url
+    - GET /v2/hashtags/{hid}/topics
+
+    Notes:
+    - ZSXQ occasionally returns transient JSON errors with HTTP 200 (e.g. code=1059 "内部错误").
+      We treat those as retryable with a small backoff to reduce flakiness.
 
     The returned download_url is typically a short-lived signed URL to files.zsxq.com (token + expiry).
     """
@@ -48,6 +54,36 @@ class ZsxqClient:
             "Referer": f"https://wx.zsxq.com/dweb2/index/group/{group_id}",
         }
 
+    def _get_json_with_retry(
+        self,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        retry_1059: int = 5,
+    ) -> dict:
+        """GET JSON with retry for known transient ZSXQ API error code=1059.
+
+        ZSXQ sometimes returns HTTP 200 but JSON payload has succeeded=false and code=1059.
+        We retry a few times with exponential backoff.
+        """
+        last: dict | None = None
+        for attempt in range(retry_1059 + 1):
+            r = self._client.get(path, params=params, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            last = data
+            if not isinstance(data, dict):
+                return data
+            if data.get("succeeded") is False and str(data.get("code")) == "1059":
+                if attempt >= retry_1059:
+                    return data
+                # backoff: 0.5, 1, 2, 4, 8...
+                time.sleep(min(8.0, 0.5 * (2**attempt)))
+                continue
+            return data
+        return last or {}
+
     def list_files(
         self,
         *,
@@ -56,13 +92,11 @@ class ZsxqClient:
         index: str | None = None,
         sort: str = "by_create_time",
     ) -> dict:
-        r = self._client.get(
+        return self._get_json_with_retry(
             f"/v2/groups/{group_id}/files",
             params={k: v for k, v in {"count": str(count), "index": index, "sort": sort}.items() if v is not None},
             headers=self._headers_for_group(group_id),
         )
-        r.raise_for_status()
-        return r.json()
 
     def list_hashtag_topics(
         self,
@@ -74,20 +108,16 @@ class ZsxqClient:
         params: dict[str, str] = {"count": str(count)}
         if end_time is not None:
             params["end_time"] = end_time
-        r = self._client.get(
+        return self._get_json_with_retry(
             f"/v2/hashtags/{hid}/topics",
             params=params,
         )
-        r.raise_for_status()
-        return r.json()
 
     def get_file_download_url(self, *, file_id: str, group_id: str) -> str:
-        r = self._client.get(
+        data = self._get_json_with_retry(
             f"/v2/files/{file_id}/download_url",
             headers=self._headers_for_group(group_id),
         )
-        r.raise_for_status()
-        data = r.json()
         if not data.get("succeeded"):
             code = data.get("code")
             msg = data.get("message") or data.get("error") or "unknown error"

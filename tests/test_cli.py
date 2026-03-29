@@ -28,7 +28,7 @@ def _parse_json(stdout: str) -> dict:
     return json.loads(stdout.strip())
 
 
-def _seed_group(data_dir: Path, *, attachment_status: str = "new") -> Path:
+def _seed_group(data_dir: Path, *, attachment_status: str = "new", filename: str = "report.pdf") -> Path:
     db_path = data_dir / "db" / "app.sqlite3"
     ensure_schema(db_path)
     save_tags(
@@ -59,7 +59,7 @@ def _seed_group(data_dir: Path, *, attachment_status: str = "new") -> Path:
                 attachment_id="file-1",
                 group_id=GROUP_ID,
                 topic_id="topic-1",
-                filename="report.pdf",
+                filename=filename,
                 size_bytes=123,
                 download_count=0,
                 create_time=CREATE_TIME,
@@ -72,14 +72,17 @@ def _seed_group(data_dir: Path, *, attachment_status: str = "new") -> Path:
             tag_ids=["10000000000001"],
         )
         if attachment_status == "downloaded":
-            pdf_path = data_dir / "示例标签A" / "20260316" / "report.pdf"
-            pdf_path.parent.mkdir(parents=True, exist_ok=True)
-            pdf_path.write_bytes(b"%PDF-1.4\n")
+            file_path = data_dir / "示例标签A" / "20260316" / filename
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.lower().endswith(".pdf"):
+                file_path.write_bytes(b"%PDF-1.4\n")
+            else:
+                file_path.write_text("dummy", encoding="utf-8")
             set_attachment_downloaded(
                 conn,
                 attachment_id="file-1",
-                download_url="https://example.com/report.pdf",
-                local_path=str(pdf_path),
+                download_url=f"https://example.com/{filename}",
+                local_path=str(file_path),
                 sha256="abc123",
             )
         conn.commit()
@@ -153,12 +156,73 @@ def test_download_dry_run_json_lists_planned_items_without_cookies(tmp_path: Pat
     assert payload["summary"]["dry_run"] is True
     assert payload["summary"]["planned"] == 1
     assert payload["summary"]["downloaded"] == 0
+    assert payload["summary"]["counts_by_ext"] == {"pdf": 1}
     assert payload["summary"]["items"][0]["tag_name"] == "示例标签A"
     assert payload["summary"]["items"][0]["path"].endswith("20260316\\report.pdf")
 
     with connect(db_path) as conn:
         row = conn.execute("SELECT status FROM attachments WHERE attachment_id=?", ("file-1",)).fetchone()
     assert row[0] == "new"
+
+
+def test_download_dry_run_includes_docx(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    _seed_group(data_dir, filename="report.docx")
+
+    result = runner.invoke(
+        app,
+        [
+            "--json",
+            "download",
+            "--group",
+            GROUP_ID,
+            "--data-dir",
+            str(data_dir),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = _parse_json(result.stdout)
+    assert payload["summary"]["planned"] == 1
+    assert payload["summary"]["counts_by_ext"] == {"docx": 1}
+    assert payload["summary"]["items"][0]["path"].endswith("20260316\\report.docx")
+
+
+def test_convert_uses_office_converter_for_docx(tmp_path: Path, monkeypatch):
+    data_dir = tmp_path / "data"
+    db_path = _seed_group(data_dir, attachment_status="downloaded", filename="report.docx")
+
+    def fake_office_document_to_markdown_result(path: Path, *, title: str | None = None):
+        assert path.name == "report.docx"
+        from zsxq_pdf.convert.office_to_md import OfficeMarkdownResult
+        return OfficeMarkdownResult(markdown=f"# {title}\n\nconverted docx\n", converter="pandoc-docx-direct")
+
+    monkeypatch.setattr("zsxq_pdf.convert.office_to_md.office_document_to_markdown_result", fake_office_document_to_markdown_result)
+
+    result = runner.invoke(
+        app,
+        [
+            "--json",
+            "convert",
+            "--group",
+            GROUP_ID,
+            "--data-dir",
+            str(data_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = _parse_json(result.stdout)
+    assert payload["summary"]["converted"] == 1
+    assert payload["summary"]["counts_by_ext"] == {"docx": 1}
+    assert payload["summary"]["counts_by_converter"] == {"pandoc-docx-direct": 1}
+    md_path = data_dir / "示例标签A" / "20260316" / "report.md"
+    assert md_path.exists()
+    assert "converted docx" in md_path.read_text(encoding="utf-8")
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT status FROM attachments WHERE attachment_id=?", ("file-1",)).fetchone()
+    assert row[0] == "converted"
 
 
 def test_doctor_json_reports_cookie_source(tmp_path: Path):

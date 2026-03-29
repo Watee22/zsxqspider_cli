@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timedelta
 
 import typer
 from rich.console import Console
@@ -21,6 +23,11 @@ app = Typer(
 )
 console = Console()
 stderr_console = Console(stderr=True)
+
+
+def _ext_key(filename: str | None) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    return suffix.lstrip(".") or "unknown"
 
 
 @dataclass(frozen=True)
@@ -268,6 +275,32 @@ def sync(
     )
 
 
+def _decrement_zsxq_end_time(value: str | None) -> str | None:
+    """ZSXQ hashtag API uses inclusive end_time.
+
+    If we pass the last topic's create_time back as end_time, the API may return
+    that exact same last topic again (infinite loop, 1 topic per page).
+
+    We subtract 1ms to make the next query strictly earlier.
+    """
+    if not value:
+        return value
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            dt2 = dt - timedelta(milliseconds=1)
+            base = dt2.strftime("%Y-%m-%dT%H:%M:%S")
+            ms = int(dt2.microsecond / 1000)
+            tz = dt2.strftime("%z")
+            return f"{base}.{ms:03d}{tz}"
+        except Exception:
+            continue
+
+    # If parsing fails, fall back to original (better than crashing).
+    return value
+
+
 def _sync_by_tag(ctx: Context, conn, client, group, tags_to_sync, count, max_pages):
     """Per-tag sync via /v2/hashtags/{hid}/topics."""
     from zsxq_pdf.store.repo import (
@@ -365,7 +398,7 @@ def _sync_by_tag(ctx: Context, conn, client, group, tags_to_sync, count, max_pag
             _print(ctx, f"  page {tag_pages}: +{len(topics)} topics")
             _emit_event(ctx, "sync", "page", tag_name=td.name, tag_id=td.tag_id, page=tag_pages, topics=len(topics))
 
-            end_time = topics[-1].get("create_time")
+            end_time = _decrement_zsxq_end_time(topics[-1].get("create_time"))
 
             if max_pages and tag_pages >= max_pages:
                 break
@@ -527,12 +560,13 @@ def download(
     only_unclassified: bool = Option(False, help="Only download attachments with no matched tag."),
     dry_run: bool = Option(False, help="Show planned downloads without fetching files or changing SQLite state."),
 ):
-    """Download PDFs for attachments marked as new.
+    """Download supported document attachments marked as new.
 
     Uses /v2/files/{file_id}/download_url to fetch a short-lived signed URL.
 
     Output layout:
-      data/<tag>/<YYYYMMDD>/<filename>.pdf
+      data/<tag>/<YYYYMMDD>/<filename>
+    Supported document types: pdf / doc / docx / wps.
     Where tag comes from tags.json registry match; otherwise _unclassified.
     """
     cfg = AppConfig(data_dir=data_dir)
@@ -563,6 +597,7 @@ def download(
     planned = 0
     planned_items: list[dict[str, Any]] = []
     failures: list[str] = []
+    ext_counts: Counter[str] = Counter()
     statuses = ["new"] + (["failed"] if retry_failed else [])
 
     _emit_event(
@@ -610,6 +645,7 @@ def download(
                             "path": str(dest_path),
                         }
                         planned += 1
+                        ext_counts[_ext_key(filename)] += 1
                         planned_items.append(item)
                         _print(ctx, f"Would download {filename} -> {dest_path}")
                         _emit_event(ctx, "download", "item_planned", **item)
@@ -663,6 +699,7 @@ def download(
                                 )
                                 conn.commit()
                                 downloaded += 1
+                                ext_counts[_ext_key(filename)] += 1
                                 _print(ctx, f"Downloaded {filename} -> {path}")
                                 _emit_event(
                                     ctx,
@@ -732,6 +769,7 @@ def download(
         "downloaded": downloaded,
         "failed": failed,
         "statuses": statuses,
+        "counts_by_ext": dict(sorted(ext_counts.items())),
     }
     if dry_run:
         summary["items"] = planned_items
@@ -762,16 +800,18 @@ def convert(
     only_unclassified: bool = Option(False, help="Only convert attachments with no matched tag."),
     dry_run: bool = Option(False, help="Show planned conversions without writing Markdown or changing SQLite state."),
 ):
-    """Convert downloaded PDFs to Markdown.
+    """Convert downloaded supported documents to Markdown.
 
     Output layout:
       data/<tag>/<YYYYMMDD>/<filename>.md
 
+    Supported source types: pdf / doc / docx / wps.
     If --only-unclassified is set, only items with no matched tag are processed.
     """
     cfg = AppConfig(data_dir=data_dir)
     ensure_schema(cfg.db_path)
 
+    from zsxq_pdf.convert.office_to_md import office_document_to_markdown_result
     from zsxq_pdf.convert.pdf_to_md import pdf_to_markdown
     from zsxq_pdf.store.repo import (
         connect,
@@ -789,6 +829,8 @@ def convert(
     planned = 0
     planned_items: list[dict[str, Any]] = []
     failures: list[str] = []
+    ext_counts: Counter[str] = Counter()
+    converter_counts: Counter[str] = Counter()
 
     _emit_event(ctx, "convert", "start", group_id=group, day=(day or None), dry_run=dry_run, tag_names=tag)
 
@@ -828,6 +870,7 @@ def convert(
                         "path": str(out_path),
                     }
                     planned += 1
+                    ext_counts[_ext_key(Path(pdf_path).name)] += 1
                     planned_items.append(item)
                     _print(ctx, f"Would convert {pdf_path} -> {out_path}")
                     _emit_event(ctx, "convert", "item_planned", **item)
@@ -836,11 +879,20 @@ def convert(
                 out_dir.mkdir(parents=True, exist_ok=True)
 
                 try:
-                    md = pdf_to_markdown(Path(pdf_path), title=row["filename"])
+                    source_path = Path(pdf_path)
+                    if source_path.suffix.lower() == ".pdf":
+                        md = pdf_to_markdown(source_path, title=row["filename"])
+                        converter_name = "pymupdf-pdf"
+                    else:
+                        office_result = office_document_to_markdown_result(source_path, title=row["filename"])
+                        md = office_result.markdown
+                        converter_name = office_result.converter
                     out_path.write_text(md, encoding="utf-8")
                     set_attachment_converted(conn, attachment_id=file_id)
                     conn.commit()
                     converted += 1
+                    ext_counts[_ext_key(source_path.name)] += 1
+                    converter_counts[converter_name] += 1
                     _print(ctx, f"Converted {pdf_path} -> {out_path}")
                     _emit_event(
                         ctx,
@@ -890,6 +942,8 @@ def convert(
         "planned": planned,
         "converted": converted,
         "failed": failed,
+        "counts_by_ext": dict(sorted(ext_counts.items())),
+        "counts_by_converter": dict(sorted(converter_counts.items())),
     }
     if dry_run:
         summary["items"] = planned_items
